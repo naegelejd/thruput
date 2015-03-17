@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"runtime"
 	"time"
 )
 
@@ -18,12 +19,14 @@ const (
 )
 
 var (
-	bufsize  int    = 0
-	protocol string = "tcp"
-	window   int    = 0
-	duration int    = 10
-	divisor  int    = sizes[defaultFormat]
-	unit     string = units[defaultFormat]
+	bufsize    int    = 0
+	protocol   string = "tcp"
+	window     int    = 0
+	duration   int    = 10
+	interval   int    = 1
+	divisor    int    = sizes[defaultFormat]
+	unit       string = units[defaultFormat]
+	numClients int    = 1
 )
 
 type Runner interface {
@@ -45,15 +48,20 @@ var units = map[rune]string{
 }
 
 func main() {
+	runtime.GOMAXPROCS(runtime.NumCPU())
+
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 
 	serve := flag.Bool("s", false, "run as server")
 	client := flag.String("c", "", "connect as client to server (127.0.0.1)")
 	udp := flag.Bool("udp", false, "use UDP instead of TCP")
 	length := flag.String("len", "", "buffer size (128K for tcp, 8K for udp)")
-	flag.IntVar(&window, "window", window, "window size / socket buffer size")
 	port := flag.Int("p", defaultPort, "port")
 	format := flag.String("f", string(defaultFormat), "[kmgKMG] report format")
+	flag.IntVar(&window, "window", window, "window size / socket buffer size")
+	flag.IntVar(&duration, "t", duration, "duration in seconds")
+	flag.IntVar(&interval, "i", interval, "interval in seconds")
+	flag.IntVar(&numClients, "P", numClients, "number of parallel clients to run")
 
 	flag.Parse()
 
@@ -120,55 +128,76 @@ func main() {
 	}
 }
 
+type ConnMaker func() (net.Conn, error)
+
 func (c TCPClient) Run(address string) error {
-	conn, err := makeTCPConn(address)
-	if err != nil {
-		return err
-	}
-	send(conn)
-	return nil
+	return run(func() (net.Conn, error) {
+		return makeTCPConn(address)
+	})
 }
 
 func (c UDPClient) Run(address string) error {
-	conn, err := makeUDPConn(address)
-	if err != nil {
-		return err
+	return run(func() (net.Conn, error) {
+		return makeUDPConn(address)
+	})
+}
+
+func run(maker ConnMaker) error {
+	for i := 0; i < numClients; i++ {
+		conn, err := maker()
+		if err != nil {
+			return err
+		}
+		handleConn(i, conn, conn.Write, makeTimeout())
 	}
-	send(conn)
 	return nil
 }
 
-func send(conn net.Conn) {
+func makeTimeout() <-chan bool {
+	done := make(chan bool)
+	go func() {
+		<-time.After(time.Duration(duration) * time.Second)
+		done <- true
+	}()
+	return done
+}
+
+// type Action abstracts net.Conn.Read and net.Conn.Write
+type Action func([]byte) (int, error)
+
+func handleConn(id int, conn net.Conn, action Action, terminator <-chan bool) {
 	defer func() {
-		log.Printf("closing connection to server %s\n", conn.RemoteAddr())
+		log.Printf("closing connection to %s\n", conn.RemoteAddr())
 		conn.Close()
 	}()
 
 	buffer := make([]byte, bufsize)
-	limitTimer := time.After(10 * time.Second)
-	progressTimer := time.After(1 * time.Second)
+	// limitTimer := time.After(time.Duration(duration) * time.Second)
+	progressTimer := time.After(time.Duration(interval) * time.Second)
 	total := 0
 	count := 0
 loop:
 	for {
 		select {
 		case <-progressTimer:
-			log.Printf("count: %d %s\n", count/divisor, unit)
-			progressTimer = time.After(1 * time.Second)
+			fmt.Printf("[%02d] count: %d %s\n", id, count/interval/divisor, unit)
+			progressTimer = time.After(time.Duration(interval) * time.Second)
 			count = 0
-		case <-limitTimer:
+		case <-terminator:
 			break loop
 		default:
-			n, err := conn.Write(buffer)
+			n, err := action(buffer)
 			if err != nil {
-				log.Println("write error: ", err)
+				if err != io.EOF {
+					log.Println("IO error: ", err)
+				}
 				break loop
 			}
 			count += n
 			total += n
 		}
 	}
-	log.Printf("total: %d %s\n", total/10/divisor, unit)
+	fmt.Printf("[%02d] total: %d %s\n", id, total/duration/divisor, unit)
 }
 
 func makeTCPConn(address string) (c net.Conn, err error) {
@@ -227,9 +256,8 @@ func (s TCPServer) Run(address string) error {
 		if err != nil {
 			return err
 		}
-		if err := handleNewClient(conn); err != nil {
-			return err
-		}
+		neverTerminate := make(chan bool)
+		handleConn(0, conn, conn.Read, neverTerminate)
 	}
 	return nil
 }
@@ -244,42 +272,8 @@ func (s UDPServer) Run(address string) error {
 		if err != nil {
 			return err
 		}
-		if err := handleNewClient(conn); err != nil {
-			return err
-		}
+		neverTerminate := make(chan bool)
+		handleConn(0, conn, conn.Read, neverTerminate)
 	}
-	return nil
-}
-
-func handleNewClient(conn net.Conn) error {
-	defer func() {
-		log.Printf("closing connection to client %s\n", conn.RemoteAddr())
-		conn.Close()
-	}()
-	buffer := make([]byte, bufsize)
-	progressTimer := time.After(1 * time.Second)
-	total := 0
-	count := 0
-loop:
-	for {
-		select {
-		case <-progressTimer:
-			log.Printf("count: %d %s\n", count/divisor, unit)
-			progressTimer = time.After(1 * time.Second)
-			count = 0
-		default:
-			n, err := conn.Read(buffer)
-			if err != nil {
-				if err != io.EOF {
-					log.Println("read error: ", err)
-					return fmt.Errorf("read error: %s", err)
-				}
-				break loop
-			}
-			count += n
-			total += n
-		}
-	}
-	log.Printf("total: %d %s\n", total/10/divisor, unit)
 	return nil
 }
