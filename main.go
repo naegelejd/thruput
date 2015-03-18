@@ -16,26 +16,23 @@ const (
 	defaultPort       = 10101
 	defaultClient     = "127.0.0.1"
 	defaultFormat     = 'M'
+	defaultNumConns   = 1
 )
 
 var (
-	bufsize    int    = 0
-	protocol   string = "tcp"
-	window     int    = 0
-	duration   int    = 10
-	interval   int    = 1
-	divisor    int    = sizes[defaultFormat]
-	unit       string = units[defaultFormat]
-	numClients int    = 1
+	bufsize  int    = 0
+	window   int    = 0
+	duration int    = 10
+	interval int    = 1
+	divisor  int    = sizes[defaultFormat]
+	unit     string = units[defaultFormat]
 )
 
-type Runner interface {
-	Run(address string) error
+type IperfConn interface {
+	net.Conn
+	SetWriteBuffer(bytes int) error
+	SetReadBuffer(bytes int) error
 }
-type TCPServer struct{}
-type UDPServer struct{}
-type TCPClient struct{}
-type UDPClient struct{}
 
 var sizes = map[rune]int{
 	'k': 125, 'm': 1.25e5, 'g': 1.25e8,
@@ -49,6 +46,7 @@ var units = map[rune]string{
 
 func main() {
 	runtime.GOMAXPROCS(runtime.NumCPU())
+	log.Printf("Using %d threads\n", runtime.NumCPU())
 
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 
@@ -61,7 +59,7 @@ func main() {
 	flag.IntVar(&window, "window", window, "window size / socket buffer size")
 	flag.IntVar(&duration, "t", duration, "duration in seconds")
 	flag.IntVar(&interval, "i", interval, "interval in seconds")
-	flag.IntVar(&numClients, "P", numClients, "number of parallel clients to run")
+	numConns := flag.Int("P", defaultNumConns, "number of parallel clients to run")
 
 	flag.Parse()
 
@@ -70,6 +68,7 @@ func main() {
 		log.Fatal("Must run as *either* server or client")
 	}
 
+	var protocol string = "tcp"
 	if *udp {
 		protocol = "udp"
 	}
@@ -106,49 +105,98 @@ func main() {
 	}
 
 	address := fmt.Sprintf("%s:%d", *client, *port)
-	var thing Runner
-	switch protocol {
-	case "tcp":
-		if *serve {
-			thing = TCPServer{}
-		} else {
-			thing = TCPClient{}
-		}
-	case "udp":
-		if *serve {
-			thing = UDPServer{}
-		} else {
-			thing = UDPClient{}
-		}
-	default:
-		log.Fatal("unknown protocol")
+	type Runnable interface {
+		Run() error
 	}
-	if err := thing.Run(address); err != nil {
+	var runnable Runnable
+	var err error
+	if *serve {
+		runnable, err = NewServer(protocol, address)
+		if err != nil {
+			log.Fatal(err)
+		}
+	} else {
+		runnable, err = NewClient(protocol, address, *numConns)
+		if err != nil {
+			log.Fatal(err)
+		}
+	}
+
+	if err = runnable.Run(); err != nil {
 		log.Fatal(err)
 	}
 }
 
-type ConnMaker func() (net.Conn, error)
+type ConnMaker func() (IperfConn, error)
 
-func (c TCPClient) Run(address string) error {
-	return run(func() (net.Conn, error) {
-		return makeTCPConn(address)
-	})
+type Client struct {
+	conns []IperfConn
 }
 
-func (c UDPClient) Run(address string) error {
-	return run(func() (net.Conn, error) {
-		return makeUDPConn(address)
-	})
-}
-
-func run(maker ConnMaker) error {
-	for i := 0; i < numClients; i++ {
-		conn, err := maker()
+func NewClient(protocol, address string, numConns int) (c Client, err error) {
+	var maker ConnMaker
+	switch protocol {
+	case "tcp":
+		maker = func() (IperfConn, error) { return makeTCPConn(protocol, address) }
+	case "udp":
+		maker = func() (IperfConn, error) { return makeUDPConn(protocol, address) }
+	default:
+		err = fmt.Errorf("unknown protocol")
+		return
+	}
+	for i := 0; i < numConns; i++ {
+		var conn IperfConn
+		conn, err = maker()
 		if err != nil {
-			return err
+			return
 		}
-		handleConn(i, conn, conn.Write, makeTimeout())
+		if window > 0 {
+			if err = conn.SetWriteBuffer(window); err != nil {
+				return
+			}
+			if err = conn.SetReadBuffer(window); err != nil {
+				return
+			}
+		}
+		c.conns = append(c.conns, conn)
+	}
+	return
+}
+
+func (c Client) Run() error {
+	nconns := len(c.conns)
+	allResults := make([]chan int64, nconns)
+	for i, conn := range c.conns {
+		results := make(chan int64) // unbuffered
+		allResults[i] = results
+		go handleConn(conn, conn.Write, makeTimeout(), results)
+	}
+
+	// loop as long as we have results channels to read from
+	totals := make([]int64, nconns)
+	numClosed := 0
+	for numClosed < nconns {
+		for id, results := range allResults {
+			if results == nil {
+				continue
+			}
+			count, ok := <-results
+			if !ok {
+				// channel is closed so mark it nil
+				allResults[id] = nil
+				numClosed++
+				continue
+			}
+			totals[id] += count
+			fmt.Printf("[%02d] count: %d, time: %ds, rate: %.02f %s\n", id,
+				count/int64(divisor), interval,
+				float64(count)/float64(interval)/float64(divisor), unit)
+		}
+	}
+	for id, total := range totals {
+		fmt.Printf("[%02d] count: %d, time: %ds, mean: %.02f %s\n", id,
+			total/int64(divisor), duration,
+			float64(total)/float64(duration)/float64(divisor), unit)
 	}
 	return nil
 }
@@ -165,22 +213,23 @@ func makeTimeout() <-chan bool {
 // type Action abstracts net.Conn.Read and net.Conn.Write
 type Action func([]byte) (int, error)
 
-func handleConn(id int, conn net.Conn, action Action, terminator <-chan bool) {
+func handleConn(conn net.Conn, action Action, terminator <-chan bool, results chan<- int64) {
+	// log.Printf("handling connection %d (%s)\n", id, conn.LocalAddr())
 	defer func() {
-		log.Printf("closing connection to %s\n", conn.RemoteAddr())
+		// log.Printf("closing connection to %s\n", conn.RemoteAddr())
 		conn.Close()
 	}()
 
 	buffer := make([]byte, bufsize)
-	// limitTimer := time.After(time.Duration(duration) * time.Second)
 	progressTimer := time.After(time.Duration(interval) * time.Second)
-	total := 0
-	count := 0
+	var count int64
 loop:
 	for {
 		select {
 		case <-progressTimer:
-			fmt.Printf("[%02d] count: %d %s\n", id, count/interval/divisor, unit)
+			if results != nil {
+				results <- count
+			}
 			progressTimer = time.After(time.Duration(interval) * time.Second)
 			count = 0
 		case <-terminator:
@@ -193,14 +242,15 @@ loop:
 				}
 				break loop
 			}
-			count += n
-			total += n
+			count += int64(n)
 		}
 	}
-	fmt.Printf("[%02d] total: %d %s\n", id, total/duration/divisor, unit)
+	if results != nil {
+		close(results)
+	}
 }
 
-func makeTCPConn(address string) (c net.Conn, err error) {
+func makeTCPConn(protocol, address string) (c IperfConn, err error) {
 	var tcpaddr *net.TCPAddr
 	var tcpconn *net.TCPConn
 
@@ -212,18 +262,11 @@ func makeTCPConn(address string) (c net.Conn, err error) {
 	if err != nil {
 		return
 	}
-	if window > 0 {
-		if err = tcpconn.SetWriteBuffer(window); err != nil {
-			return
-		}
-		if err = tcpconn.SetReadBuffer(window); err != nil {
-			return
-		}
-	}
+
 	return tcpconn, nil
 }
 
-func makeUDPConn(address string) (c net.Conn, err error) {
+func makeUDPConn(protocol, address string) (c IperfConn, err error) {
 	var udpaddr *net.UDPAddr
 	var udpconn *net.UDPConn
 
@@ -235,19 +278,38 @@ func makeUDPConn(address string) (c net.Conn, err error) {
 	if err != nil {
 		return
 	}
-	if window > 0 {
-		if err = udpconn.SetWriteBuffer(window); err != nil {
-			return
-		}
-		if err = udpconn.SetReadBuffer(window); err != nil {
-			return
-		}
-	}
 	return udpconn, nil
 }
 
-func (s TCPServer) Run(address string) error {
-	ln, err := net.Listen(protocol, address)
+type Server interface {
+	Run() error
+}
+
+func NewServer(protocol, address string) (s Server, err error) {
+	switch protocol {
+
+	case "tcp":
+		s = TCPServer{protocol, address}
+	case "udp":
+		s = UDPServer{protocol, address}
+	default:
+		err = fmt.Errorf("unknown protocol")
+	}
+	return
+}
+
+type TCPServer struct {
+	protocol string
+	address  string
+}
+
+type UDPServer struct {
+	protocol string
+	address  string
+}
+
+func (s TCPServer) Run() error {
+	ln, err := net.Listen(s.protocol, s.address)
 	if err != nil {
 		return err
 	}
@@ -257,23 +319,23 @@ func (s TCPServer) Run(address string) error {
 			return err
 		}
 		neverTerminate := make(chan bool)
-		handleConn(0, conn, conn.Read, neverTerminate)
+		go handleConn(conn, conn.Read, neverTerminate, nil)
 	}
 	return nil
 }
 
-func (s UDPServer) Run(address string) error {
-	udpaddr, err := net.ResolveUDPAddr(protocol, address)
+func (s UDPServer) Run() error {
+	udpaddr, err := net.ResolveUDPAddr(s.protocol, s.address)
 	if err != nil {
 		return err
 	}
 	for {
-		conn, err := net.ListenUDP(protocol, udpaddr)
+		conn, err := net.ListenUDP(s.protocol, udpaddr)
 		if err != nil {
 			return err
 		}
 		neverTerminate := make(chan bool)
-		handleConn(0, conn, conn.Read, neverTerminate)
+		go handleConn(conn, conn.Read, neverTerminate, nil)
 	}
 	return nil
 }
