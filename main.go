@@ -134,22 +134,21 @@ type Client struct {
 }
 
 func NewClient(protocol, address string, numConns int) (c Client, err error) {
-	var maker ConnMaker
-	switch protocol {
-	case "tcp":
-		maker = func() (IperfConn, error) { return makeTCPConn(protocol, address) }
-	case "udp":
-		maker = func() (IperfConn, error) { return makeUDPConn(protocol, address) }
-	default:
-		err = fmt.Errorf("unknown protocol")
-		return
-	}
 	for i := 0; i < numConns; i++ {
 		var conn IperfConn
-		conn, err = maker()
+		switch protocol {
+		case "tcp":
+			conn, err = makeTCPConn(protocol, address)
+		case "udp":
+			conn, err = makeUDPConn(protocol, address)
+		default:
+			err = fmt.Errorf("unknown protocol")
+			return
+		}
 		if err != nil {
 			return
 		}
+
 		if window > 0 {
 			if err = conn.SetWriteBuffer(window); err != nil {
 				return
@@ -308,6 +307,20 @@ type UDPServer struct {
 	address  string
 }
 
+func readForever(c net.Conn) {
+	defer c.Close()
+	buffer := make([]byte, bufsize)
+	for {
+		_, err := c.Read(buffer)
+		if err != nil {
+			if err != io.EOF {
+				log.Println(err)
+			}
+			break
+		}
+	}
+}
+
 func (s TCPServer) Run() error {
 	ln, err := net.Listen(s.protocol, s.address)
 	if err != nil {
@@ -318,8 +331,7 @@ func (s TCPServer) Run() error {
 		if err != nil {
 			return err
 		}
-		neverTerminate := make(chan bool)
-		go handleConn(conn, conn.Read, neverTerminate, nil)
+		go readForever(conn)
 	}
 	return nil
 }
@@ -334,8 +346,7 @@ func (s UDPServer) Run() error {
 		if err != nil {
 			return err
 		}
-		neverTerminate := make(chan bool)
-		go handleConn(conn, conn.Read, neverTerminate, nil)
+		readForever(conn)
 	}
 	return nil
 }
