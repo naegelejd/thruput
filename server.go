@@ -32,7 +32,12 @@ type TCPServer server
 type UDPServer server
 
 func readForever(c net.Conn) {
-	defer c.Close()
+	defer func() {
+		log.Println("Closing connection to ", c.RemoteAddr())
+		c.Close()
+	}()
+
+	log.Println("Reading from connection ", c.RemoteAddr())
 	buffer := make([]byte, bufsize)
 	for {
 		_, err := c.Read(buffer)

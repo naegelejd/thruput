@@ -43,91 +43,68 @@ func NewClient(protocol, address string, numConns int) (c Client, err error) {
 	return
 }
 
+func writeForever(conn IperfConn, byteCount *uint64) {
+	buffer := make([]byte, bufsize)
+	for {
+		n, err := conn.Write(buffer)
+		if err != nil {
+			if err != io.EOF {
+				log.Println("IO error: ", err)
+			}
+		}
+		*byteCount += uint64(n)
+	}
+}
+
 func (c Client) Run() error {
 	nconns := len(c.conns)
-	allResults := make([]chan int64, nconns)
-	for i, conn := range c.conns {
-		results := make(chan int64) // unbuffered
-		allResults[i] = results
-		go handleConn(conn, conn.Write, makeTimeout(), results)
+
+	counts := make([]uint64, nconns)
+	lastCounts := make([]uint64, nconns)
+	startTimes := make([]time.Time, nconns)
+	lastTimes := make([]time.Time, nconns)
+
+	for id, conn := range c.conns {
+		go writeForever(conn, &counts[id])
+		now := time.Now()
+		startTimes[id] = now
+		lastTimes[id] = now
 	}
 
-	// loop as long as we have results channels to read from
-	totals := make([]int64, nconns)
-	numClosed := 0
-	for numClosed < nconns {
-		for id, results := range allResults {
-			if results == nil {
-				continue
-			}
-			count, ok := <-results
-			if !ok {
-				// channel is closed so mark it nil
-				allResults[id] = nil
-				numClosed++
-				continue
-			}
-			totals[id] += count
-			fmt.Printf("[%02d] count: %d, time: %ds, rate: %.02f %s\n", id,
-				count/int64(divisor), interval,
-				float64(count)/float64(interval)/float64(divisor), unit)
-		}
-	}
-	for id, total := range totals {
-		fmt.Printf("[%02d] count: %d, time: %ds, mean: %.02f %s\n", id,
-			total/int64(divisor), duration,
-			float64(total)/float64(duration)/float64(divisor), unit)
-	}
-	return nil
-}
-
-func makeTimeout() <-chan bool {
-	done := make(chan bool)
-	go func() {
-		<-time.After(time.Duration(duration) * time.Second)
-		done <- true
-	}()
-	return done
-}
-
-// type Action abstracts net.Conn.Read and net.Conn.Write
-type Action func([]byte) (int, error)
-
-func handleConn(conn net.Conn, action Action, terminator <-chan bool, results chan<- int64) {
-	// log.Printf("handling connection %d (%s)\n", id, conn.LocalAddr())
-	defer func() {
-		// log.Printf("closing connection to %s\n", conn.RemoteAddr())
-		conn.Close()
-	}()
-
-	buffer := make([]byte, bufsize)
-	progressTimer := time.After(time.Duration(interval) * time.Second)
-	var count int64
+	progress := time.After(time.Duration(interval) * time.Second)
+	stop := time.After(time.Duration(duration) * time.Second)
 loop:
 	for {
 		select {
-		case <-progressTimer:
-			if results != nil {
-				results <- count
+		case <-progress:
+			for id := 0; id < nconns; id++ {
+				now := time.Now()
+				totalBytes := counts[id]
+				diffBytes := totalBytes - lastCounts[id]
+				totalTime := now.Sub(startTimes[id]).Seconds()
+				diffTime := now.Sub(lastTimes[id]).Seconds()
+				rate := float64(diffBytes) / diffTime / float64(divisor)
+				meanRate := float64(totalBytes) / totalTime / float64(divisor)
+				fmt.Printf("[%02d] sent: %.02f, time: %.02fs, rate: %.02f %s, mean: %.02f %s\n",
+					id, float64(diffBytes)/float64(divisor), totalTime, rate, unit, meanRate, unit)
+				lastCounts[id] = totalBytes
+				lastTimes[id] = now
 			}
-			progressTimer = time.After(time.Duration(interval) * time.Second)
-			count = 0
-		case <-terminator:
+			progress = time.After(time.Duration(interval) * time.Second)
+		case <-stop:
 			break loop
 		default:
-			n, err := action(buffer)
-			if err != nil {
-				if err != io.EOF {
-					log.Println("IO error: ", err)
-				}
-				break loop
-			}
-			count += int64(n)
 		}
 	}
-	if results != nil {
-		close(results)
+	for id := 0; id < nconns; id++ {
+		count := counts[id]
+		diff := time.Now().Sub(startTimes[id]).Seconds()
+		fmt.Printf("[%02d] total: %.02f, time: %.02fs, mean: %.02f %s\n",
+			id, float64(count)/float64(divisor), diff,
+			float64(count)/float64(diff)/float64(divisor), unit)
 	}
+
+	return nil
 }
 
 func makeTCPConn(protocol, address string) (c IperfConn, err error) {
