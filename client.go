@@ -8,6 +8,12 @@ import (
 	"time"
 )
 
+type IperfConn interface {
+	net.Conn
+	SetWriteBuffer(bytes int) error
+	SetReadBuffer(bytes int) error
+}
+
 type ConnMaker func() (IperfConn, error)
 
 type Client struct {

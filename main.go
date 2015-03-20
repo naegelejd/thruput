@@ -1,36 +1,28 @@
 package main
 
 import (
-	"flag"
 	"fmt"
 	"log"
-	"net"
+	"os"
 	"runtime"
+
+	"gopkg.in/alecthomas/kingpin.v1"
 )
 
 const (
 	defaultBufsizeTCP = 128000 // 128K
 	defaultBufsizeUDP = 8000   // 8K
-	defaultPort       = 10101
-	defaultClient     = "127.0.0.1"
 	defaultFormat     = 'M'
-	defaultNumConns   = 1
 )
 
 var (
-	bufsize    int    = 0
-	sysBufSize int    = 0
-	duration   int    = 10
-	interval   int    = 1
+	bufsize    int
+	sysBufSize int
+	duration   int
+	interval   int
 	divisor    int    = sizes[defaultFormat]
 	unit       string = units[defaultFormat]
 )
-
-type IperfConn interface {
-	net.Conn
-	SetWriteBuffer(bytes int) error
-	SetReadBuffer(bytes int) error
-}
 
 var sizes = map[rune]int{
 	'k': 125, 'm': 1.25e5, 'g': 1.25e8,
@@ -47,25 +39,25 @@ func main() {
 
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 
-	serve := flag.Bool("s", false, "run as server")
-	client := flag.String("c", "", "connect as client to server (127.0.0.1)")
-	udp := flag.Bool("udp", false, "use UDP instead of TCP")
-	length := flag.String("len", "", "application buffer size (128K for tcp, 8K for udp)")
-	port := flag.Int("p", defaultPort, "port")
-	format := flag.String("f", string(defaultFormat), "[kmgKMG] report format")
-	flag.IntVar(&sysBufSize, "sys", sysBufSize, "OS socket buffer size")
-	flag.IntVar(&duration, "t", duration, "duration in seconds")
-	flag.IntVar(&interval, "i", interval, "interval in seconds")
-	numConns := flag.Int("P", defaultNumConns, "number of parallel clients to run")
+	app := kingpin.New("iperf", "a tcp/udp network throughput measurement tool")
+	// debug := app.Flag("debug", "enable debug mode").Bool()
+	port := app.Flag("port", "specify port").Short('p').Default("10101").Int()
+	udp := app.Flag("udp", "use UDP instead of TCP").Short('u').Bool()
+	length := app.Flag("len", "application buffer size (128K for tcp, 8K for udp)").Short('l').String()
+	clientCmd := app.Command("client", "run as client")
+	host := clientCmd.Arg("host", "host to connect to").Required().String()
+	numConns := clientCmd.Flag("num", "number of concurrent clients").Short('P').Default("1").Int()
+	format := clientCmd.Flag("fmt", "report format").Short('f').PlaceHolder("[kmgKMG]").Default(string(defaultFormat)).String()
+	clientCmd.Flag("duration", "duration in seconds").Short('t').Default("10").IntVar(&duration)
+	clientCmd.Flag("interval", "interval in seconds").Short('i').Default("1").IntVar(&interval)
+	clientCmd.Flag("sys", "OS socket buffer size").IntVar(&sysBufSize)
+	serverCmd := app.Command("server", "run as server")
 
-	flag.Parse()
+	parsed := kingpin.MustParse(app.Parse(os.Args[1:]))
 
-	if !*serve && *client == "" ||
-		*serve && *client != "" {
-		log.Fatal("Must run as *either* server or client")
-	}
+	fmt.Println(duration, interval)
 
-	var protocol string = "tcp"
+	var protocol = "tcp"
 	if *udp {
 		protocol = "udp"
 	}
@@ -94,29 +86,32 @@ func main() {
 		}
 	}
 
-	label := []rune(*format)[0]
-	divisor = sizes[label]
-	unit = units[label]
-	if divisor == 0 || unit == "" {
-		log.Fatal("invalid format")
-	}
+	address := fmt.Sprintf("%s:%d", *host, *port)
 
-	address := fmt.Sprintf("%s:%d", *client, *port)
 	type Runnable interface {
 		Run() error
 	}
 	var runnable Runnable
 	var err error
-	if *serve {
-		runnable, err = NewServer(protocol, address)
-		if err != nil {
-			log.Fatal(err)
+	switch {
+	case parsed == clientCmd.FullCommand():
+		label := []rune(*format)[0]
+		divisor = sizes[label]
+		unit = units[label]
+		if divisor == 0 || unit == "" {
+			log.Fatal("invalid format")
 		}
-	} else {
 		runnable, err = NewClient(protocol, address, *numConns)
 		if err != nil {
 			log.Fatal(err)
 		}
+	case parsed == serverCmd.FullCommand():
+		runnable, err = NewServer(protocol, address)
+		if err != nil {
+			log.Fatal(err)
+		}
+	default:
+		log.Fatal("Must run as *either* server or client")
 	}
 
 	if err = runnable.Run(); err != nil {
