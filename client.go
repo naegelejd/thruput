@@ -20,7 +20,7 @@ type Client struct {
 	conns []IperfConn
 }
 
-func NewClient(protocol, address string, numConns int) (c Client, err error) {
+func NewClient(protocol, address string, sysBufSize int, numConns int) (c Client, err error) {
 	for i := 0; i < numConns; i++ {
 		var conn IperfConn
 		switch protocol {
@@ -62,6 +62,52 @@ func writeForever(conn IperfConn, byteCount *uint64) {
 	}
 }
 
+func autoLabel(bps float64) (rate float64, label string) {
+	switch {
+	case bps > 1e9:
+		rate = bps / 1.25e8
+		label = "gbps"
+	case bps > 1e6:
+		rate = bps / 1.25e5
+		label = "mbps"
+	case bps > 1e3:
+		rate = bps / 125
+		label = "kbps"
+	default:
+		rate = bps
+		label = "bps"
+	}
+	return
+}
+
+func report(id int, sentb uint64, period float64, ratebps float64, meanbps float64) {
+	var sent float64
+	var sentUnit string
+	switch {
+	case sentb > 1e9:
+		sent = float64(sentb) / 1e9
+		sentUnit = "GB"
+	case sentb > 1e6:
+		sent = float64(sentb) / 1e6
+		sentUnit = "MB"
+	default:
+		sent = float64(sentb) / 1e3
+		sentUnit = "KB"
+	}
+
+	var rate, mean float64
+	var rateLabel, meanLabel string
+	if unit == autoUnit {
+		rate, rateLabel = autoLabel(ratebps)
+		mean, meanLabel = autoLabel(meanbps)
+	} else {
+		rate, rateLabel = ratebps/unit.Divisor, unit.Label
+		mean, meanLabel = meanbps/unit.Divisor, unit.Label
+	}
+	fmt.Printf("[%2d] time: %.02fs, sent: %.02f %s, rate: %.02f %s, mean: %.02f %s\n",
+		id, period, sent, sentUnit, rate, rateLabel, mean, meanLabel)
+}
+
 func (c Client) Run() error {
 	nconns := len(c.conns)
 
@@ -77,8 +123,8 @@ func (c Client) Run() error {
 		lastTimes[id] = now
 	}
 
-	progress := time.After(time.Duration(interval) * time.Second)
-	stop := time.After(time.Duration(duration) * time.Second)
+	progress := makeIntervalTimer()
+	stop := makeStopTimer()
 loop:
 	for {
 		select {
@@ -89,14 +135,13 @@ loop:
 				diffBytes := totalBytes - lastCounts[id]
 				totalTime := now.Sub(startTimes[id]).Seconds()
 				diffTime := now.Sub(lastTimes[id]).Seconds()
-				rate := float64(diffBytes) / diffTime / float64(divisor)
-				meanRate := float64(totalBytes) / totalTime / float64(divisor)
-				fmt.Printf("[%02d] sent: %.02f, time: %.02fs, rate: %.02f %s, mean: %.02f %s\n",
-					id, float64(diffBytes)/float64(divisor), totalTime, rate, unit, meanRate, unit)
+				rate := float64(diffBytes) / diffTime
+				meanRate := float64(totalBytes) / totalTime
 				lastCounts[id] = totalBytes
 				lastTimes[id] = now
+				report(id, diffBytes, totalTime, rate, meanRate)
 			}
-			progress = time.After(time.Duration(interval) * time.Second)
+			progress = makeIntervalTimer()
 		case <-stop:
 			break loop
 		default:
@@ -105,9 +150,7 @@ loop:
 	for id := 0; id < nconns; id++ {
 		count := counts[id]
 		diff := time.Now().Sub(startTimes[id]).Seconds()
-		fmt.Printf("[%02d] total: %.02f, time: %.02fs, mean: %.02f %s\n",
-			id, float64(count)/float64(divisor), diff,
-			float64(count)/float64(diff)/float64(divisor), unit)
+		report(id, count, diff, float64(count)/diff, float64(count)/diff)
 	}
 
 	return nil

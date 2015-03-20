@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"runtime"
+	"time"
 
 	"gopkg.in/alecthomas/kingpin.v1"
 )
@@ -12,26 +13,64 @@ import (
 const (
 	defaultBufsizeTCP = 128000 // 128K
 	defaultBufsizeUDP = 8000   // 8K
-	defaultFormat     = 'M'
 )
 
 var (
-	bufsize    int
-	sysBufSize int
-	duration   int
-	interval   int
-	divisor    int    = sizes[defaultFormat]
-	unit       string = units[defaultFormat]
+	bufsize           int
+	unit              *Unit
+	makeStopTimer     func() <-chan time.Time
+	makeIntervalTimer func() <-chan time.Time
 )
 
-var sizes = map[rune]int{
-	'k': 125, 'm': 1.25e5, 'g': 1.25e8,
-	'K': 1e3, 'M': 1e6, 'G': 1e9,
+const (
+	unitAuto = 'A'
+	unitKbps = 'k'
+	unitMbps = 'm'
+	unitGbps = 'g'
+	unitKB_s = 'K'
+	unitMB_s = 'M'
+	unitGB_s = 'G'
+)
+
+var unitMultipliers = map[rune]int{
+	unitKB_s: 1024, unitMB_s: 1024 * 1024, unitGB_s: 1024 * 1024 * 1024,
 }
 
-var units = map[rune]string{
-	'k': "kbps", 'm': "mbps", 'g': "gbps",
-	'K': "KB/s", 'M': "MB/s", 'G': "GB/s",
+type Unit struct {
+	Divisor float64
+	Label   string
+}
+
+var autoUnit = &Unit{}
+var units = map[rune]*Unit{
+	unitAuto: autoUnit,
+	unitKbps: &Unit{125, "kbps"}, unitMbps: &Unit{1.25e5, "mbps"},
+	unitGbps: &Unit{1.25e8, "gbps"}, unitKB_s: &Unit{1e3, "KB/s"},
+	unitMB_s: &Unit{1e6, "MB/s"}, unitGB_s: &Unit{1e9, "GB/s"},
+}
+
+func allUnits() []string {
+	return []string{string(unitAuto),
+		string(unitKbps), string(unitMbps), string(unitGbps),
+		string(unitKB_s), string(unitMB_s), string(unitGB_s),
+	}
+}
+
+func die(msg string) {
+	fmt.Println("error:", msg)
+	os.Exit(1)
+}
+
+func makeTimer(seconds float64) func() <-chan time.Time {
+	if seconds <= 0 {
+		return func() <-chan time.Time {
+			return nil
+		}
+	} else {
+		return func() <-chan time.Time {
+			return time.After(time.Duration(seconds * float64(time.Second)))
+		}
+	}
 }
 
 func main() {
@@ -40,26 +79,25 @@ func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 
 	app := kingpin.New("iperf", "a tcp/udp network throughput measurement tool")
-	// debug := app.Flag("debug", "enable debug mode").Bool()
 	port := app.Flag("port", "specify port").Short('p').Default("10101").Int()
 	udp := app.Flag("udp", "use UDP instead of TCP").Short('u').Bool()
-	length := app.Flag("len", "application buffer size (128K for tcp, 8K for udp)").Short('l').String()
+	length := app.Flag("len", "application buffer size (128K for tcp, 8K for udp)").Short('l').PlaceHolder("#[KMG]").String()
 	clientCmd := app.Command("client", "run as client")
 	host := clientCmd.Arg("host", "host to connect to").Required().String()
-	numConns := clientCmd.Flag("num", "number of concurrent clients").Short('P').Default("1").Int()
-	format := clientCmd.Flag("fmt", "report format").Short('f').PlaceHolder("[kmgKMG]").Default(string(defaultFormat)).String()
-	clientCmd.Flag("duration", "duration in seconds").Short('t').Default("10").IntVar(&duration)
-	clientCmd.Flag("interval", "interval in seconds").Short('i').Default("1").IntVar(&interval)
-	clientCmd.Flag("sys", "OS socket buffer size").IntVar(&sysBufSize)
+	numConns := clientCmd.Flag("nclients", "number of concurrent clients").Short('P').Default("1").Int()
+	format := clientCmd.Flag("format", "transfer rate units [A=auto]").Short('f').Default(string(unitAuto)).Enum(allUnits()...)
+	duration := clientCmd.Flag("duration", "duration in seconds [0=forever]").Short('t').Default("10").Float()
+	interval := clientCmd.Flag("interval", "interval in seconds [0=none]").Short('i').Default("1").Float()
+	sysBufSize := clientCmd.Flag("sys", "OS socket buffer size").Int()
 	serverCmd := app.Command("server", "run as server")
 
 	parsed := kingpin.MustParse(app.Parse(os.Args[1:]))
 
-	fmt.Println(duration, interval)
-
 	var protocol = "tcp"
+	bufsize = defaultBufsizeTCP
 	if *udp {
 		protocol = "udp"
+		bufsize = defaultBufsizeUDP
 	}
 
 	if len(*length) > 0 {
@@ -69,20 +107,11 @@ func main() {
 			log.Fatal(err)
 		}
 		if bufsize < 0 {
-			log.Fatal("buffer size must be > 0")
+			die("buffer size must be > 0")
 		}
-		bufsize *= sizes[label]
+		bufsize *= unitMultipliers[label]
 		if bufsize == 0 {
-			log.Fatal("invalid unit label")
-		}
-	} else {
-		switch protocol {
-		case "tcp":
-			bufsize = defaultBufsizeTCP
-		case "udp":
-			bufsize = defaultBufsizeUDP
-		default:
-			log.Fatal("unknown protocol")
+			die("invalid unit label")
 		}
 	}
 
@@ -95,13 +124,17 @@ func main() {
 	var err error
 	switch {
 	case parsed == clientCmd.FullCommand():
-		label := []rune(*format)[0]
-		divisor = sizes[label]
-		unit = units[label]
-		if divisor == 0 || unit == "" {
-			log.Fatal("invalid format")
+		u := []rune(*format)[0]
+		unit = units[u]
+		if unit == nil {
+			die("invalid format")
 		}
-		runnable, err = NewClient(protocol, address, *numConns)
+		if *numConns < 1 {
+			die("nclients must be > 0")
+		}
+		makeIntervalTimer = makeTimer(*interval)
+		makeStopTimer = makeTimer(*duration)
+		runnable, err = NewClient(protocol, address, *sysBufSize, *numConns)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -111,7 +144,7 @@ func main() {
 			log.Fatal(err)
 		}
 	default:
-		log.Fatal("Must run as *either* server or client")
+		die("Must run as *either* server or client")
 	}
 
 	if err = runnable.Run(); err != nil {
