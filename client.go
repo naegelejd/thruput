@@ -8,21 +8,21 @@ import (
 	"time"
 )
 
-type IperfConn interface {
+type Conn interface {
 	net.Conn
 	SetWriteBuffer(bytes int) error
 	SetReadBuffer(bytes int) error
 }
 
-type ConnMaker func() (IperfConn, error)
+type ConnMaker func() (Conn, error)
 
 type Client struct {
-	conns []IperfConn
+	conns []Conn
 }
 
 func NewClient(protocol, address string, sysBufSize int, numConns int) (c Client, err error) {
 	for i := 0; i < numConns; i++ {
-		var conn IperfConn
+		var conn Conn
 		switch protocol {
 		case "tcp":
 			conn, err = makeTCPConn(protocol, address)
@@ -49,7 +49,7 @@ func NewClient(protocol, address string, sysBufSize int, numConns int) (c Client
 	return
 }
 
-func writeForever(conn IperfConn, byteCount *uint64) {
+func writeForever(conn Conn, byteCount *uint64) {
 	buffer := make([]byte, bufsize)
 	for {
 		n, err := conn.Write(buffer)
@@ -156,7 +156,7 @@ loop:
 	return nil
 }
 
-func makeTCPConn(protocol, address string) (c IperfConn, err error) {
+func makeTCPConn(protocol, address string) (c Conn, err error) {
 	var tcpaddr *net.TCPAddr
 	var tcpconn *net.TCPConn
 
@@ -172,7 +172,7 @@ func makeTCPConn(protocol, address string) (c IperfConn, err error) {
 	return tcpconn, nil
 }
 
-func makeUDPConn(protocol, address string) (c IperfConn, err error) {
+func makeUDPConn(protocol, address string) (c Conn, err error) {
 	var udpaddr *net.UDPAddr
 	var udpconn *net.UDPConn
 

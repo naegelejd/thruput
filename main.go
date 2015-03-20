@@ -78,7 +78,7 @@ func main() {
 
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 
-	app := kingpin.New("iperf", "a tcp/udp network throughput measurement tool")
+	app := kingpin.New("thruput", "a tcp/udp network throughput measurement tool")
 	port := app.Flag("port", "specify port").Short('p').Default("10101").Int()
 	udp := app.Flag("udp", "use UDP instead of TCP").Short('u').Bool()
 	length := app.Flag("len", "application buffer size (128K for tcp, 8K for udp)").Short('l').PlaceHolder("#[KMG]").String()

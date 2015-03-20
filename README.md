@@ -1,4 +1,4 @@
-# iperf
+# thruput
 
 ## Notes
 
