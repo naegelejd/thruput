@@ -125,12 +125,13 @@ func (c Client) Run() error {
 
 	progress := makeIntervalTimer()
 	stop := makeStopTimer()
+	var now time.Time
 loop:
 	for {
 		select {
-		case <-progress:
+		case now = <-progress:
+			progress = makeIntervalTimer()
 			for id := 0; id < nconns; id++ {
-				now := time.Now()
 				totalBytes := counts[id]
 				diffBytes := totalBytes - lastCounts[id]
 				totalTime := now.Sub(startTimes[id]).Seconds()
@@ -141,15 +142,14 @@ loop:
 				lastTimes[id] = now
 				report(id, diffBytes, totalTime, rate, meanRate)
 			}
-			progress = makeIntervalTimer()
-		case <-stop:
+		case now = <-stop:
 			break loop
 		default:
 		}
 	}
 	for id := 0; id < nconns; id++ {
 		count := counts[id]
-		diff := time.Now().Sub(startTimes[id]).Seconds()
+		diff := now.Sub(startTimes[id]).Seconds()
 		report(id, count, diff, float64(count)/diff, float64(count)/diff)
 	}
 
