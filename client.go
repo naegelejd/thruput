@@ -64,13 +64,19 @@ func writeForever(conn Conn, byteCount *uint64) {
 
 func autoLabel(bps float64) (rate float64, label string) {
 	switch {
-	case bps > 1e9:
+	case bps > 1.25e11:
+		rate = bps / 1.25e11
+		label = "tbps"
+	// case bps > 1e9:
+	case bps > 1.25e8:
 		rate = bps / 1.25e8
 		label = "gbps"
-	case bps > 1e6:
+	// case bps > 1e6:
+	case bps > 1.25e5:
 		rate = bps / 1.25e5
 		label = "mbps"
-	case bps > 1e3:
+	// case bps > 1e3:
+	case bps > 125:
 		rate = bps / 125
 		label = "kbps"
 	default:
@@ -80,10 +86,16 @@ func autoLabel(bps float64) (rate float64, label string) {
 	return
 }
 
+func printHeader() {
+}
+
 func report(id int, sentb uint64, period float64, ratebps float64, meanbps float64) {
 	var sent float64
 	var sentUnit string
 	switch {
+	case sentb > 1e12:
+		sent = float64(sentb) / 1e12
+		sentUnit = "TB"
 	case sentb > 1e9:
 		sent = float64(sentb) / 1e9
 		sentUnit = "GB"
@@ -104,7 +116,9 @@ func report(id int, sentb uint64, period float64, ratebps float64, meanbps float
 		rate, rateLabel = ratebps/unit.Divisor, unit.Label
 		mean, meanLabel = meanbps/unit.Divisor, unit.Label
 	}
-	fmt.Printf("[%2d] time: %.02fs, sent: %.02f %s, rate: %.02f %s, mean: %.02f %s\n",
+
+	// fmt.Printf("[%3d] time: %6.2fs\tsent: %6.02f %s\trate: %6.02f %s\tmean: %6.02f %s\n",
+	fmt.Printf("[%3d] | %6.02fs | %6.02f %s | %6.02f %s\t| %6.02f %s\n",
 		id, period, sent, sentUnit, rate, rateLabel, mean, meanLabel)
 }
 
@@ -115,6 +129,8 @@ func (c Client) Run() error {
 	lastCounts := make([]uint64, nconns)
 	startTimes := make([]time.Time, nconns)
 	lastTimes := make([]time.Time, nconns)
+
+	fmt.Println("  ID  |  Time   |   Count   |       Rate        |       Mean")
 
 	for id, conn := range c.conns {
 		go writeForever(conn, &counts[id])
@@ -142,16 +158,24 @@ loop:
 				lastTimes[id] = now
 				report(id, diffBytes, totalTime, rate, meanRate)
 			}
+			if nconns > 1 {
+				fmt.Println("----------------------------------------")
+			}
 		case now = <-stop:
 			break loop
 		default:
 		}
 	}
+	var sumRate float64
 	for id := 0; id < nconns; id++ {
 		count := counts[id]
 		diff := now.Sub(startTimes[id]).Seconds()
-		report(id, count, diff, float64(count)/diff, float64(count)/diff)
+		rate := float64(count) / diff
+		report(id, count, diff, rate, rate)
+		sumRate += rate
 	}
+	rate, label := autoLabel(sumRate)
+	fmt.Printf("Throughput: %.2f %s\n", rate, label)
 
 	return nil
 }
