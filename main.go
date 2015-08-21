@@ -66,10 +66,9 @@ func makeTimer(seconds float64) func() <-chan time.Time {
 		return func() <-chan time.Time {
 			return nil
 		}
-	} else {
-		return func() <-chan time.Time {
-			return time.After(time.Duration(seconds * float64(time.Second)))
-		}
+	}
+	return func() <-chan time.Time {
+		return time.After(time.Duration(seconds * float64(time.Second)))
 	}
 }
 

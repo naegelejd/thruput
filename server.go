@@ -62,7 +62,6 @@ func (s TCPServer) Run() error {
 		}
 		go readForever(conn)
 	}
-	return nil
 }
 
 func (s UDPServer) Run() error {
@@ -77,5 +76,4 @@ func (s UDPServer) Run() error {
 		}
 		readForever(conn)
 	}
-	return nil
 }
